@@ -1,6 +1,7 @@
 import Cocoa
 import FlutterMacOS
-import GameController
+import IOKit
+import IOKit.hid
 import CoreAudio
 import AudioToolbox
 
@@ -18,6 +19,13 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
 
+    // ── Activity source ───────────────────────────────────────────────
+    enum ActivitySource {
+        case hid
+        case controller
+        case audio
+    }
+
     // ── State ─────────────────────────────────────────────────────────
     private let channel: FlutterMethodChannel
 
@@ -29,9 +37,11 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
     private var idleThresholdMs: Int  = 300_000
     private var debug              = false
 
-    private var userIsActive       = true
-    private var lastActivityTime   = Date()
-    private let activityLock       = NSLock()
+    private var userIsActive            = true
+    private var lastHumanActivityTime   = Date()
+    private var lastAudioActivityTime   = Date()
+    private var audioIsPlaying          = false
+    private let activityLock            = NSLock()
 
     // Audio — property listener on default output device
     private var outputDeviceID: AudioDeviceID = kAudioObjectUnknown
@@ -40,9 +50,12 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
     private var runningListenerInstalled = false
     private var deviceChangeListenerInstalled = false
 
-    // HID — NSEvent monitors (sandbox-compatible)
+    // HID — NSEvent monitors (sandbox-compatible, mouse/tablet/trackpad)
     private var globalEventMonitor: Any?
     private var localEventMonitor: Any?
+
+    // Controllers — IOHIDManager (works in background, sandbox-safe for controllers)
+    private var controllerHIDManager: IOHIDManager?
 
     // Inactivity timer
     private var inactivityTimer: Timer?
@@ -169,18 +182,36 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // Activity signal
+    // Activity signal — source-aware
     // ════════════════════════════════════════════════════════════════════
 
-    func recordActivity() {
-        activityLock.lock()
-        lastActivityTime = Date()
-        activityLock.unlock()
+    func recordActivity(source: ActivitySource = .hid) {
+        switch source {
+        case .hid, .controller:
+            activityLock.lock()
+            lastHumanActivityTime = Date()
+            activityLock.unlock()
 
-        if !userIsActive {
-            userIsActive = true
-            DispatchQueue.main.async { [weak self] in
-                self?.channel.invokeMethod("onUserActive", arguments: nil)
+            if !userIsActive {
+                userIsActive = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.channel.invokeMethod("onUserActive", arguments: nil)
+                }
+            }
+
+        case .audio:
+            activityLock.lock()
+            lastAudioActivityTime = Date()
+            audioIsPlaying = true
+            activityLock.unlock()
+
+            // Audio alone can mark active ONLY if there was recent human activity
+            let humanElapsed = Date().timeIntervalSince(lastHumanActivityTime) * 1000
+            if humanElapsed < Double(idleThresholdMs) && !userIsActive {
+                userIsActive = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.channel.invokeMethod("onUserActive", arguments: nil)
+                }
             }
         }
     }
@@ -210,13 +241,23 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
 
     private func checkInactivity() {
         activityLock.lock()
-        let elapsed = Date().timeIntervalSince(lastActivityTime) * 1000
+        let humanElapsed = Date().timeIntervalSince(lastHumanActivityTime) * 1000
+        let audioElapsed = Date().timeIntervalSince(lastAudioActivityTime) * 1000
+        if audioElapsed > 10_000 { audioIsPlaying = false }
+        let audioPlaying = audioIsPlaying
         activityLock.unlock()
 
-        if elapsed > Double(idleThresholdMs) && userIsActive {
+        let humanIdle = humanElapsed > Double(idleThresholdMs)
+
+        if humanIdle && userIsActive {
             userIsActive = false
-            if debug { print("[DAM] Inactivity after \(Int(elapsed))ms") }
-            channel.invokeMethod("onUserInactivity", arguments: nil)
+            if debug {
+                print("[DAM] User IDLE — no human input for \(Int(humanElapsed))ms (audio: \(audioPlaying))")
+            }
+            channel.invokeMethod("onUserInactivity", arguments: [
+                "humanIdleMs": Int(humanElapsed),
+                "audioPlaying": audioPlaying
+            ])
         }
     }
 
@@ -250,7 +291,7 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
 
         if isOutputDeviceRunning() {
             if debug { print("[DAM] Audio: device \(deviceID) already running at start") }
-            recordActivity()
+            recordActivity(source: .audio)
             startAudioPolling()
         }
 
@@ -339,7 +380,7 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
         if debug { print("[DAM] Audio: output device running = \(running)") }
 
         if running {
-            recordActivity()
+            recordActivity(source: .audio)
             startAudioPolling()
         } else {
             stopAudioPolling()
@@ -358,8 +399,8 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
                 return
             }
             if self.isOutputDeviceRunning() {
-                if self.debug { print("[DAM] Audio: still running — activity") }
-                self.recordActivity()
+                if self.debug { print("[DAM] Audio: still running") }
+                self.recordActivity(source: .audio)
             } else {
                 self.stopAudioPolling()
             }
@@ -414,18 +455,14 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
         installRunningListener(on: newDeviceID)
 
         if isOutputDeviceRunning() {
-            recordActivity()
+            recordActivity(source: .audio)
             startAudioPolling()
         }
     }
 
     // ════════════════════════════════════════════════════════════════════
     // HID — NSEvent Global + Local Monitors (sandbox-compatible)
-    //
-    // Replaces IOHIDManager which cannot work inside the App Sandbox.
-    // Monitors mouse, trackpad, tablet (Wacom etc.), scroll, gesture
-    // events system-wide. Does NOT monitor keyboard (that would require
-    // Accessibility permission).
+    // Tablet, trackpad gestures only — excludes mouse and keyboard
     // ════════════════════════════════════════════════════════════════════
 
     private func setHIDMonitoring(_ enabled: Bool) {
@@ -443,55 +480,38 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
         guard globalEventMonitor == nil else { return }
 
         let eventMask: NSEvent.EventTypeMask = [
-            // Mouse
-            .mouseMoved,
-            .leftMouseDown,
-            .leftMouseUp,
-            .rightMouseDown,
-            .rightMouseUp,
-            .leftMouseDragged,
-            .rightMouseDragged,
-            .otherMouseDown,
-            .otherMouseUp,
-            .otherMouseDragged,
-            .scrollWheel,
-            // Tablet (drawing tablets)
             .tabletPoint,
             .tabletProximity,
-            // Trackpad gestures
-            .gesture,
             .magnify,
-            .swipe,
             .rotate,
+            .swipe,
             .smartMagnify,
             .pressure,
             .directTouch,
         ]
 
-        // Global — events in OTHER applications
         globalEventMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: eventMask
         ) { [weak self] event in
             guard let self = self, self.monitorHID else { return }
             if self.debug {
-                print("[DAM] Global event: type=\(event.type.rawValue)")
+                print("[DAM] Global HID event: type=\(event.type.rawValue)")
             }
-            self.recordActivity()
+            self.recordActivity(source: .hid)
         }
 
-        // Local — events in OUR application
         localEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: eventMask
         ) { [weak self] event in
             guard let self = self, self.monitorHID else { return event }
             if self.debug {
-                print("[DAM] Local event: type=\(event.type.rawValue)")
+                print("[DAM] Local HID event: type=\(event.type.rawValue)")
             }
-            self.recordActivity()
+            self.recordActivity(source: .hid)
             return event
         }
 
-        if debug { print("[DAM] HID monitoring started (NSEvent monitors)") }
+        if debug { print("[DAM] HID monitoring started (tablet/trackpad gestures only)") }
     }
 
     private func stopHIDMonitoring() {
@@ -507,7 +527,12 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // Controllers — GameController framework
+    // Controllers — IOHIDManager (works in background, sandbox-safe)
+    //
+    // GameController framework only delivers events when the app is
+    // frontmost. IOHIDManager with controller-specific matching works
+    // in the background AND inside the App Sandbox because game
+    // controllers are not protected by Input Monitoring.
     // ════════════════════════════════════════════════════════════════════
 
     private func setControllerMonitoring(_ enabled: Bool) {
@@ -522,65 +547,125 @@ public class DeviceActivityMonitorPlugin: NSObject, FlutterPlugin {
     }
 
     private func startControllerMonitoring() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(controllerConnected(_:)),
-            name: .GCControllerDidConnect,
-            object: nil)
+        guard controllerHIDManager == nil else { return }
 
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(controllerDisconnected(_:)),
-            name: .GCControllerDidDisconnect,
-            object: nil)
+        let manager = IOHIDManagerCreate(
+            kCFAllocatorDefault,
+            IOOptionBits(kIOHIDOptionsTypeNone))
 
-        for controller in GCController.controllers() {
-            registerControllerHandlers(controller)
+        // Match ONLY game controllers — NOT protected by Input Monitoring
+        let matchingCriteria: [[String: Any]] = [
+            // Joystick (Usage Page 0x01, Usage 0x04)
+            [
+                kIOHIDDeviceUsagePageKey as String: 0x01,
+                kIOHIDDeviceUsageKey as String: 0x04
+            ],
+            // Game Pad (Usage Page 0x01, Usage 0x05)
+            [
+                kIOHIDDeviceUsagePageKey as String: 0x01,
+                kIOHIDDeviceUsageKey as String: 0x05
+            ],
+            // Multi-axis Controller (Usage Page 0x01, Usage 0x08)
+            [
+                kIOHIDDeviceUsagePageKey as String: 0x01,
+                kIOHIDDeviceUsageKey as String: 0x08
+            ],
+            // Simulation Controls (flight sticks, racing wheels)
+            [
+                kIOHIDDeviceUsagePageKey as String: 0x02
+            ],
+            // Game Controls
+            [
+                kIOHIDDeviceUsagePageKey as String: 0x05
+            ],
+        ]
+
+        IOHIDManagerSetDeviceMatchingMultiple(manager, matchingCriteria as CFArray)
+
+        // Device connected
+        let matchCallback: IOHIDDeviceCallback = { context, _, _, device in
+            guard let ctx = context else { return }
+            let plugin = Unmanaged<DeviceActivityMonitorPlugin>
+                .fromOpaque(ctx)
+                .takeUnretainedValue()
+
+            let name = IOHIDDeviceGetProperty(
+                device, kIOHIDProductKey as CFString) as? String ?? "unknown"
+            if plugin.debug {
+                print("[DAM] Controller connected: \(name)")
+            }
         }
 
-        GCController.startWirelessControllerDiscovery {}
+        // Device disconnected
+        let removeCallback: IOHIDDeviceCallback = { context, _, _, device in
+            guard let ctx = context else { return }
+            let plugin = Unmanaged<DeviceActivityMonitorPlugin>
+                .fromOpaque(ctx)
+                .takeUnretainedValue()
 
-        if debug {
-            print("[DAM] Controller monitoring started (\(GCController.controllers().count) connected)")
+            if plugin.debug {
+                print("[DAM] Controller disconnected")
+            }
+        }
+
+        // Input — fires for every button press, stick move, trigger pull
+        let inputCallback: IOHIDValueCallback = { context, _, _, value in
+            guard let ctx = context else { return }
+            let plugin = Unmanaged<DeviceActivityMonitorPlugin>
+                .fromOpaque(ctx)
+                .takeUnretainedValue()
+            guard plugin.monitorControllers else { return }
+
+            if plugin.debug {
+                let element = IOHIDValueGetElement(value)
+                let usagePage = IOHIDElementGetUsagePage(element)
+                let usage = IOHIDElementGetUsage(element)
+                let intValue = IOHIDValueGetIntegerValue(value)
+                print("[DAM] Controller input: page=0x\(String(format: "%02X", usagePage)) usage=0x\(String(format: "%02X", usage)) value=\(intValue)")
+            }
+
+            plugin.recordActivity(source: .controller)
+        }
+
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, matchCallback, ctx)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, removeCallback, ctx)
+        IOHIDManagerRegisterInputValueCallback(manager, inputCallback, ctx)
+
+        IOHIDManagerScheduleWithRunLoop(
+            manager,
+            CFRunLoopGetMain(),
+            CFRunLoopMode.defaultMode.rawValue)
+
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+
+        if openResult == kIOReturnSuccess {
+            controllerHIDManager = manager
+            if debug {
+                print("[DAM] Controller monitoring started (IOHIDManager — works in background)")
+            }
+        } else {
+            IOHIDManagerUnscheduleFromRunLoop(
+                manager,
+                CFRunLoopGetMain(),
+                CFRunLoopMode.defaultMode.rawValue)
+            if debug {
+                print("[DAM] Controller HID manager open failed: \(openResult)")
+            }
         }
     }
 
     private func stopControllerMonitoring() {
-        NotificationCenter.default.removeObserver(self, name: .GCControllerDidConnect, object: nil)
-        NotificationCenter.default.removeObserver(self, name: .GCControllerDidDisconnect, object: nil)
-        GCController.stopWirelessControllerDiscovery()
+        guard let manager = controllerHIDManager else { return }
 
-        for controller in GCController.controllers() {
-            controller.extendedGamepad?.valueChangedHandler = nil
-            controller.microGamepad?.valueChangedHandler    = nil
-        }
+        IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerUnscheduleFromRunLoop(
+            manager,
+            CFRunLoopGetMain(),
+            CFRunLoopMode.defaultMode.rawValue)
 
+        controllerHIDManager = nil
         if debug { print("[DAM] Controller monitoring stopped") }
-    }
-
-    @objc private func controllerConnected(_ notification: Notification) {
-        guard let controller = notification.object as? GCController else { return }
-        if debug { print("[DAM] Controller connected: \(controller.vendorName ?? "unknown")") }
-        registerControllerHandlers(controller)
-    }
-
-    @objc private func controllerDisconnected(_ notification: Notification) {
-        if debug { print("[DAM] Controller disconnected") }
-    }
-
-    private func registerControllerHandlers(_ controller: GCController) {
-        controller.extendedGamepad?.valueChangedHandler = {
-            [weak self] (gamepad: GCExtendedGamepad, element: GCControllerElement) in
-            guard let self = self, self.monitorControllers else { return }
-            if self.debug { print("[DAM] Extended gamepad input") }
-            self.recordActivity()
-        }
-
-        controller.microGamepad?.valueChangedHandler = {
-            [weak self] (gamepad: GCMicroGamepad, element: GCControllerElement) in
-            guard let self = self, self.monitorControllers else { return }
-            if self.debug { print("[DAM] Micro gamepad input") }
-            self.recordActivity()
-        }
     }
 }
