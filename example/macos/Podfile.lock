@@ -1,0 +1,22 @@
+PODS:
+  - device_activity_monitor (0.1.0):
+    - FlutterMacOS
+  - FlutterMacOS (1.0.0)
+
+DEPENDENCIES:
+  - device_activity_monitor (from `Flutter/ephemeral/.symlinks/plugins/device_activity_monitor/macos`)
+  - FlutterMacOS (from `Flutter/ephemeral`)
+
+EXTERNAL SOURCES:
+  device_activity_monitor:
+    :path: Flutter/ephemeral/.symlinks/plugins/device_activity_monitor/macos
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+
+SPEC CHECKSUMS:
+  device_activity_monitor: 562552061b7c489df8919a27da80a694315fef8f
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+
+PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
+
+COCOAPODS: 1.16.2
